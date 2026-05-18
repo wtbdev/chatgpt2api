@@ -23,6 +23,11 @@ EXPORT_TIMEZONE = timezone(timedelta(hours=8))
 CODEX_CLIENT_ID = "app_EMoamEEZ73f0CkXaXp7hrann"
 CODEX_TOKEN_URL = "https://auth.openai.com/oauth/token"
 CODEX_REFRESH_LEAD = timedelta(days=5)
+UNRECOVERABLE_REFRESH_ERROR_MARKERS = (
+    "refresh_token_expired",
+    "invalid_grant",
+    "refresh_token_reused",
+)
 
 
 def _clean_string(value: Any) -> str:
@@ -79,6 +84,11 @@ def _parse_timestamp(value: Any) -> datetime | None:
 
 def _nested_dict(value: Any) -> dict[str, Any]:
     return value if isinstance(value, dict) else {}
+
+
+def _is_unrecoverable_refresh_error(error: Any) -> bool:
+    text = str(error or "").lower()
+    return any(marker in text for marker in UNRECOVERABLE_REFRESH_ERROR_MARKERS)
 
 
 def _token_expiration(access_token: str) -> datetime | None:
@@ -609,7 +619,10 @@ class AccountService:
                 try:
                     account = future.result()
                 except Exception as exc:
-                    errors.append({"token": anonymize_token(futures[future]), "error": str(exc)})
+                    token = futures[future]
+                    if _is_unrecoverable_refresh_error(exc):
+                        self.update_account(token, {"status": "异常", "quota": 0})
+                    errors.append({"token": anonymize_token(token), "error": str(exc)})
                     continue
                 if account is not None:
                     refreshed += 1

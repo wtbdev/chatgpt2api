@@ -175,6 +175,36 @@ class AccountExportTests(unittest.TestCase):
         ):
             self.assertEqual(service.get_text_access_token(), new_access_token)
 
+    def test_refresh_accounts_marks_unrecoverable_refresh_errors_abnormal(self) -> None:
+        for marker in ("refresh_token_expired", "invalid_grant", "refresh_token_reused"):
+            with self.subTest(marker=marker):
+                access_token = make_jwt({"exp": 0})
+                service = AccountService(
+                    MemoryStorage(
+                        [
+                            {
+                                "access_token": access_token,
+                                "refresh_token": "rt_old",
+                                "status": "正常",
+                                "quota": 3,
+                            }
+                        ]
+                    )
+                )
+
+                with patch(
+                    "services.account_service._refresh_codex_oauth_token",
+                    side_effect=RuntimeError(f"token refresh failed: {marker}"),
+                ):
+                    result = service.refresh_accounts([access_token])
+
+                account = service.get_account(access_token)
+                self.assertEqual(result["refreshed"], 0)
+                self.assertEqual(len(result["errors"]), 1)
+                self.assertIsNotNone(account)
+                self.assertEqual(account["status"], "异常")
+                self.assertEqual(account["quota"], 0)
+
 
 if __name__ == "__main__":
     unittest.main()

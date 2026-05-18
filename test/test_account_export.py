@@ -2,6 +2,7 @@ import base64
 import json
 import unittest
 from typing import Any
+from unittest.mock import patch
 
 from services.account_service import AccountService
 
@@ -112,6 +113,67 @@ class AccountExportTests(unittest.TestCase):
         self.assertEqual(account["export_type"], "codex")
         self.assertEqual(account["refresh_token"], "rt_test")
         self.assertEqual(account["account_id"], "acct_123")
+
+    def test_refresh_oauth_account_replaces_access_token_key(self) -> None:
+        old_access_token = make_jwt({"exp": 0})
+        new_access_token = make_jwt({"exp": 4102444800})
+        service = AccountService(
+            MemoryStorage(
+                [
+                    {
+                        "access_token": old_access_token,
+                        "refresh_token": "rt_old",
+                        "id_token": "id_old",
+                    }
+                ]
+            )
+        )
+
+        with patch(
+            "services.account_service._refresh_codex_oauth_token",
+            return_value={
+                "access_token": new_access_token,
+                "refresh_token": "rt_new",
+                "id_token": "id_new",
+                "expired": "2100-01-01T00:00:00+00:00",
+                "email": "new@example.com",
+            },
+        ) as refresh:
+            resolved = service.refresh_oauth_account(old_access_token, force=True)
+
+        refresh.assert_called_once_with("rt_old")
+        self.assertEqual(resolved, new_access_token)
+        self.assertIsNone(service.get_account(old_access_token))
+        account = service.get_account(new_access_token)
+        self.assertIsNotNone(account)
+        self.assertEqual(account["refresh_token"], "rt_new")
+        self.assertEqual(account["id_token"], "id_new")
+        self.assertEqual(account["email"], "new@example.com")
+
+    def test_get_text_access_token_refreshes_expired_oauth_account(self) -> None:
+        old_access_token = make_jwt({"exp": 0})
+        new_access_token = make_jwt({"exp": 4102444800})
+        service = AccountService(
+            MemoryStorage(
+                [
+                    {
+                        "access_token": old_access_token,
+                        "refresh_token": "rt_old",
+                        "status": "正常",
+                    }
+                ]
+            )
+        )
+
+        with patch(
+            "services.account_service._refresh_codex_oauth_token",
+            return_value={
+                "access_token": new_access_token,
+                "refresh_token": "rt_new",
+                "expired": "2100-01-01T00:00:00+00:00",
+            },
+        ):
+            self.assertEqual(service.get_text_access_token(), new_access_token)
 
 
 if __name__ == "__main__":

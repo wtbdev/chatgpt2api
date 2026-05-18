@@ -7,16 +7,22 @@ from datetime import datetime, timedelta, timezone
 from threading import Condition, Lock
 from typing import Any
 
+from curl_cffi.requests import Session
+
 from services.config import config
 from services.log_service import (
     LOG_TYPE_ACCOUNT,
     log_service,
 )
+from services.proxy_service import proxy_settings
 from services.storage.base import StorageBackend
 from utils.helper import anonymize_token
 
 
 EXPORT_TIMEZONE = timezone(timedelta(hours=8))
+CODEX_CLIENT_ID = "app_EMoamEEZ73f0CkXaXp7hrann"
+CODEX_TOKEN_URL = "https://auth.openai.com/oauth/token"
+CODEX_REFRESH_LEAD = timedelta(days=5)
 
 
 def _clean_string(value: Any) -> str:
@@ -46,8 +52,129 @@ def _format_timestamp(value: Any) -> str:
     return datetime.fromtimestamp(timestamp, tz=timezone.utc).astimezone(EXPORT_TIMEZONE).isoformat(timespec="seconds")
 
 
+def _parse_timestamp(value: Any) -> datetime | None:
+    if value is None:
+        return None
+    if isinstance(value, datetime):
+        return value if value.tzinfo else value.replace(tzinfo=timezone.utc)
+    if isinstance(value, (int, float)):
+        try:
+            return datetime.fromtimestamp(float(value), tz=timezone.utc)
+        except (OverflowError, OSError, ValueError):
+            return None
+
+    text = str(value or "").strip()
+    if not text:
+        return None
+    if text.isdigit():
+        return _parse_timestamp(int(text))
+    if text.endswith("Z"):
+        text = text[:-1] + "+00:00"
+    try:
+        parsed = datetime.fromisoformat(text)
+    except ValueError:
+        return None
+    return parsed if parsed.tzinfo else parsed.replace(tzinfo=timezone.utc)
+
+
 def _nested_dict(value: Any) -> dict[str, Any]:
     return value if isinstance(value, dict) else {}
+
+
+def _token_expiration(access_token: str) -> datetime | None:
+    return _parse_timestamp(_decode_jwt_payload(access_token).get("exp"))
+
+
+def _account_expiration(account: dict[str, Any]) -> datetime | None:
+    for key in ("expired", "expires_at", "expiresAt", "expire", "expiry", "expires"):
+        if parsed := _parse_timestamp(account.get(key)):
+            return parsed
+    return _token_expiration(_clean_string(account.get("access_token")))
+
+
+def _jwt_auth_claims(token: str) -> dict[str, Any]:
+    return _nested_dict(_decode_jwt_payload(token).get("https://api.openai.com/auth"))
+
+
+def _refresh_codex_oauth_token(refresh_token: str) -> dict[str, Any]:
+    refresh_token = _clean_string(refresh_token)
+    if not refresh_token:
+        raise ValueError("refresh_token is required")
+
+    session = Session(**proxy_settings.build_session_kwargs(impersonate="edge101", verify=True))
+    try:
+        response = session.post(
+            CODEX_TOKEN_URL,
+            headers={
+                "Accept": "application/json",
+                "Content-Type": "application/x-www-form-urlencoded",
+            },
+            data={
+                "client_id": CODEX_CLIENT_ID,
+                "grant_type": "refresh_token",
+                "refresh_token": refresh_token,
+                "scope": "openid profile email",
+            },
+            timeout=30,
+        )
+        try:
+            body = response.json()
+        except Exception:
+            body = {}
+        if response.status_code != 200:
+            detail = body if body else response.text
+            raise RuntimeError(f"token refresh failed: HTTP {response.status_code}: {detail}")
+        if not isinstance(body, dict):
+            raise RuntimeError("token refresh payload is invalid")
+    finally:
+        session.close()
+
+    access_token = _clean_string(body.get("access_token"))
+    if not access_token:
+        raise RuntimeError("token refresh returned empty access_token")
+
+    now = datetime.now(timezone.utc)
+    expires_in = 0
+    try:
+        expires_in = int(body.get("expires_in") or 0)
+    except (TypeError, ValueError):
+        expires_in = 0
+    expires_at = now + timedelta(seconds=expires_in) if expires_in > 0 else _token_expiration(access_token)
+
+    id_token = _clean_string(body.get("id_token"))
+    id_claims = _decode_jwt_payload(id_token)
+    access_claims = _decode_jwt_payload(access_token)
+    id_auth = _jwt_auth_claims(id_token)
+    access_auth = _jwt_auth_claims(access_token)
+    profile = _nested_dict(access_claims.get("https://api.openai.com/profile"))
+
+    refreshed: dict[str, Any] = {
+        "access_token": access_token,
+        "refresh_token": _clean_string(body.get("refresh_token")) or refresh_token,
+        "last_refresh": now.isoformat(timespec="seconds"),
+        "export_type": "codex",
+    }
+    if id_token:
+        refreshed["id_token"] = id_token
+    if token_type := _clean_string(body.get("token_type")):
+        refreshed["token_type"] = token_type
+    if expires_in > 0:
+        refreshed["expires_in"] = expires_in
+    if expires_at is not None:
+        refreshed["expired"] = expires_at.astimezone(timezone.utc).isoformat(timespec="seconds")
+
+    email = _clean_string(id_claims.get("email")) or _clean_string(profile.get("email"))
+    account_id = (
+        _clean_string(access_auth.get("chatgpt_account_id"))
+        or _clean_string(id_auth.get("chatgpt_account_id"))
+        or _clean_string(id_auth.get("user_id"))
+    )
+    if email:
+        refreshed["email"] = email
+    if account_id:
+        refreshed["account_id"] = account_id
+
+    return refreshed
 
 
 class AccountService:
@@ -56,6 +183,7 @@ class AccountService:
     def __init__(self, storage_backend: StorageBackend):
         self.storage = storage_backend
         self._lock = Lock()
+        self._oauth_refresh_lock = Lock()
         self._image_slot_condition = Condition(self._lock)
         self._index = 0
         self._accounts = self._load_accounts()
@@ -162,7 +290,11 @@ class AccountService:
                 self.release_image_slot(access_token)
                 continue
             if self._is_image_account_available(account or {}):
-                return access_token
+                resolved_token = _clean_string((account or {}).get("access_token")) or access_token
+                if resolved_token != access_token:
+                    with self._image_slot_condition:
+                        self._image_inflight[resolved_token] = int(self._image_inflight.get(resolved_token, 0)) + 1
+                return resolved_token
             self.release_image_slot(access_token)
 
     def get_text_access_token(self, excluded_tokens: set[str] | None = None) -> str:
@@ -179,6 +311,14 @@ class AccountService:
                 return ""
             access_token = candidates[self._index % len(candidates)]
             self._index += 1
+        try:
+            return self.refresh_oauth_account(access_token)
+        except Exception as exc:
+            log_service.add(
+                LOG_TYPE_ACCOUNT,
+                "OAuth 刷新失败",
+                {"token": anonymize_token(access_token), "error": str(exc)},
+            )
             return access_token
 
     def mark_text_used(self, access_token: str) -> None:
@@ -340,6 +480,62 @@ class AccountService:
             return dict(account)
         return None
 
+    def _should_refresh_oauth_account(self, account: dict[str, Any], force: bool = False) -> bool:
+        if force:
+            return bool(_clean_string(account.get("refresh_token")))
+        if not _clean_string(account.get("refresh_token")):
+            return False
+        expires_at = _account_expiration(account)
+        if expires_at is None:
+            return False
+        return expires_at.astimezone(timezone.utc) - datetime.now(timezone.utc) <= CODEX_REFRESH_LEAD
+
+    def refresh_oauth_account(self, access_token: str, force: bool = False) -> str:
+        access_token = _clean_string(access_token)
+        if not access_token:
+            return ""
+
+        with self._lock:
+            account = self._accounts.get(access_token)
+            account = dict(account) if account else None
+        if not account or not self._should_refresh_oauth_account(account, force=force):
+            return access_token
+
+        refresh_token = _clean_string(account.get("refresh_token"))
+        with self._oauth_refresh_lock:
+            with self._lock:
+                latest = self._accounts.get(access_token)
+                latest = dict(latest) if latest else None
+            if latest is None:
+                return access_token
+            if not self._should_refresh_oauth_account(latest, force=force):
+                return _clean_string(latest.get("access_token")) or access_token
+
+            refreshed = _refresh_codex_oauth_token(refresh_token)
+            new_access_token = _clean_string(refreshed.get("access_token"))
+            if not new_access_token:
+                raise RuntimeError("token refresh returned empty access_token")
+
+            with self._lock:
+                current = self._accounts.get(access_token)
+                if current is None:
+                    return new_access_token
+                merged = {**current, **refreshed}
+                account = self._normalize_account(merged)
+                if account is None:
+                    raise RuntimeError("refreshed account payload is invalid")
+                if new_access_token != access_token:
+                    self._accounts.pop(access_token, None)
+                    self._image_inflight.pop(access_token, None)
+                self._accounts[new_access_token] = account
+                self._save_accounts()
+                log_service.add(
+                    LOG_TYPE_ACCOUNT,
+                    "OAuth token 已刷新",
+                    {"token": anonymize_token(new_access_token)},
+                )
+            return new_access_token
+
     def mark_image_result(self, access_token: str, success: bool) -> dict | None:
         if not access_token:
             return None
@@ -379,13 +575,21 @@ class AccountService:
         if not access_token:
             raise ValueError("access_token is required")
 
+        active_token = self.refresh_oauth_account(access_token)
         try:
             from services.openai_backend_api import InvalidAccessTokenError, OpenAIBackendAPI
-            result = OpenAIBackendAPI(access_token).get_user_info()
-        except InvalidAccessTokenError:
-            self.remove_invalid_token(access_token, event)
-            raise
-        return self.update_account(access_token, result)
+            result = OpenAIBackendAPI(active_token).get_user_info()
+        except InvalidAccessTokenError as original_exc:
+            try:
+                active_token = self.refresh_oauth_account(active_token, force=True)
+            except Exception as refresh_exc:
+                raise RuntimeError(f"{original_exc}; oauth refresh failed: {refresh_exc}") from refresh_exc
+            try:
+                result = OpenAIBackendAPI(active_token).get_user_info()
+            except InvalidAccessTokenError:
+                self.remove_invalid_token(active_token, event)
+                raise
+        return self.update_account(active_token, result)
 
     def refresh_accounts(self, access_tokens: list[str]) -> dict[str, Any]:
         access_tokens = list(dict.fromkeys(token for token in access_tokens if token))

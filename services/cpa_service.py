@@ -9,6 +9,7 @@ from concurrent.futures import ThreadPoolExecutor, as_completed
 from datetime import datetime, timezone
 from pathlib import Path
 from threading import Lock
+from typing import Any
 
 from curl_cffi.requests import Session
 
@@ -181,7 +182,7 @@ def list_remote_files(pool: dict) -> list[dict]:
     return items
 
 
-def fetch_remote_access_token(pool: dict, file_name: str) -> tuple[str | None, str | None]:
+def fetch_remote_account_item(pool: dict, file_name: str) -> tuple[dict[str, Any] | None, str | None]:
     base_url = str(pool.get("base_url") or "").strip()
     secret_key = str(pool.get("secret_key") or "").strip()
     file_name = str(file_name or "").strip()
@@ -206,7 +207,8 @@ def fetch_remote_access_token(pool: dict, file_name: str) -> tuple[str | None, s
     access_token = str(payload.get("access_token") or "").strip()
     if not access_token:
         return None, "missing access_token"
-    return access_token, None
+    payload["access_token"] = access_token
+    return payload, None
 
 
 class CPAImportService:
@@ -267,19 +269,19 @@ class CPAImportService:
     def _run_import(self, pool_id: str, pool: dict, names: list[str]) -> None:
         self._update_job(pool_id, status="running")
 
-        tokens: list[str] = []
+        items: list[dict[str, Any]] = []
         max_workers = min(16, max(1, len(names)))
         with ThreadPoolExecutor(max_workers=max_workers) as executor:
-            future_map = {executor.submit(fetch_remote_access_token, pool, name): name for name in names}
+            future_map = {executor.submit(fetch_remote_account_item, pool, name): name for name in names}
             for future in as_completed(future_map):
                 file_name = future_map[future]
                 try:
-                    token, error = future.result()
+                    item, error = future.result()
                 except Exception as exc:
-                    token, error = None, str(exc)
+                    item, error = None, str(exc)
 
-                if token:
-                    tokens.append(token)
+                if item:
+                    items.append(item)
                 else:
                     self._append_error(pool_id, file_name, error or "unknown error")
 
@@ -287,7 +289,7 @@ class CPAImportService:
                 failed = len(current.get("errors") or [])
                 self._update_job(pool_id, completed=int(current.get("completed") or 0) + 1, failed=failed)
 
-        if not tokens:
+        if not items:
             current = self._config.get_import_job(pool_id) or {}
             self._update_job(
                 pool_id,
@@ -297,7 +299,8 @@ class CPAImportService:
             )
             return
 
-        add_result = account_service.add_accounts(tokens)
+        tokens = [str(item.get("access_token") or "").strip() for item in items if str(item.get("access_token") or "").strip()]
+        add_result = account_service.add_account_items(items)
         refresh_result = account_service.refresh_accounts(tokens)
         current = self._config.get_import_job(pool_id) or {}
         self._update_job(
